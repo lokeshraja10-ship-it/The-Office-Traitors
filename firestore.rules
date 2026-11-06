@@ -1,30 +1,15 @@
 rules_version = '2';
 
-// =====================================================================
-//  THE TRAITORS — Firestore security rules
-//  Paste into Firebase Console → Firestore Database → Rules → Publish
-//
-//  Security model
-//  • games/{code}                 public board (no secrets). Only the GM (creator uid) can write.
-//  • games/{code}/gm/secret       roles, PINs, keys, shields, daggers → GM only.
-//  • games/{code}/private/{key}   one doc per player; doc id = SHA-256(code|playerId|PIN).
-//                                 Can be READ by id (get) but never LISTED, so only the
-//                                 PIN holder (and the GM) can find it.
-//  • games/{code}/claims/{pid}    binds a device (anonymous uid) to a player, only allowed
-//                                 if the device proves it knows that player's private key.
-//  • games/{code}/votes/{id}      players write only their own vote, only while voting is
-//                                 open, only if they are an eligible voter. GM-only reads.
-//  • games/{code}/chamber/{key}   the Traitors' Turret; key is a random 128-bit secret
-//                                 given only to Traitors. Cannot be listed.
-// =====================================================================
 service cloud.firestore {
   match /databases/{database}/documents {
 
     function signedIn() { return request.auth != null; }
 
     match /games/{code} {
-      function gameDoc()      { return get(/databases/$(database)/documents/games/$(code)).data; }
-      function isGM()         { return signedIn() && gameDoc().gmUid == request.auth.uid; }
+      function base()         { return /databases/$(database)/documents/games/$(code); }
+      function gameDoc()      { return get(base()).data; }
+      function isGM()         { return signedIn() && (exists(/databases/$(database)/documents/games/$(code)/gmDevices/$(request.auth.uid))
+                                                      || gameDoc().gmUid == request.auth.uid); }
       function claimPath(pid) { return /databases/$(database)/documents/games/$(code)/claims/$(pid); }
       function isPlayer(pid)  { return signedIn() && exists(claimPath(pid)) && get(claimPath(pid)).data.uid == request.auth.uid; }
 
@@ -32,16 +17,33 @@ service cloud.firestore {
       allow get: if true;
       allow list: if false;
       allow create: if signedIn() && request.resource.data.gmUid == request.auth.uid;
-      allow update: if signedIn() && resource.data.gmUid == request.auth.uid
-                    && request.resource.data.gmUid == resource.data.gmUid;
-      allow delete: if signedIn() && resource.data.gmUid == request.auth.uid;
+      allow update: if isGM() && request.resource.data.gmUid == resource.data.gmUid;
+      allow delete: if isGM();
+
+      // GM password (stored only as a hash in the document ID; never readable)
+      match /gmAccess/{key} {
+        allow read: if false;
+        allow create: if signedIn() && (gameDoc().gmUid == request.auth.uid || isGM());
+        allow update: if false;
+        allow delete: if isGM();
+      }
+
+      // Devices unlocked with the GM password
+      match /gmDevices/{uid} {
+        allow get: if signedIn() && request.auth.uid == uid;
+        allow list: if isGM();
+        allow create, update: if signedIn() && request.auth.uid == uid
+          && request.resource.data.key is string
+          && exists(/databases/$(database)/documents/games/$(code)/gmAccess/$(request.resource.data.key));
+        allow delete: if signedIn() && (request.auth.uid == uid || isGM());
+      }
 
       // Game Master's secret sheet
       match /gm/{docId} {
         allow read, write: if isGM();
       }
 
-      // Each player's private dossier (role, shield, dagger, offers…)
+      // Each player's private dossier
       match /private/{key} {
         allow get: if true;
         allow list: if false;
@@ -51,7 +53,7 @@ service cloud.firestore {
                 .hasOnly(['offerResponse', 'seenRole', 'noticeSeen']));
       }
 
-      // Device ↔ player binding
+      // Device to player binding
       match /claims/{pid} {
         allow read: if isGM() || (signedIn() && resource.data.uid == request.auth.uid);
         allow create, update: if signedIn()
@@ -71,7 +73,7 @@ service cloud.firestore {
           && request.resource.data.voter in gameDoc().vote.voters;
       }
 
-      // The Traitors' Turret (knowing the secret key = access)
+      // The Traitors' room
       match /chamber/{key} {
         allow get, create, update: if signedIn();
         allow list, delete: if false;

@@ -12,6 +12,13 @@ Pure HTML/CSS/JavaScript (no build step), hosted on **GitHub Pages**, data in **
 
 ---
 
+## 🆕 What changed (v2)
+
+- **GM password login:** set a GM password when creating a game. Open `gm.html` on any phone or laptop, enter the game code + password, and that device becomes a Game Master console too. **🔒 Log out** in the GM top bar locks a device again.
+- **Sticky broadcasts:** a 📣 broadcast stays on every phone and the big screen until you send a new one or press **✖ Clear message**.
+- **Hidden Turret:** every player has the same four tabs (Castle · My role · Players · 📝 Notes). Notes is a private notepad for everyone. Traitors open their secret room by **pressing and holding the "My notes" title for 1 second**. It closes with *Done*, on changing tab, or when the phone screen is locked.
+- ⚠️ Re-publish **firestore.rules** after uploading.
+
 ## 1. One-time setup (≈ 15 minutes)
 
 ### A. Create the Firebase project
