@@ -1,5 +1,5 @@
 // =====================================================================
-//  THE TRAITORS — Game Master console
+//  THE TRAITORS — Game Master console  (v4: 2 night actions + win odds)
 // =====================================================================
 import {
   db, R, ensureAuth, errMsg, toast, modal, confirmBox, promptBox, h, esc, $, $$,
@@ -21,6 +21,38 @@ const S = {
 const app = $("#app");
 const L = (text) => ({ t: Date.now() + Math.random(), day: S.game?.day || 0, text });
 const unlockKey = (code) => "traitors.gm.unlocked." + code;
+const ACT_TYPES = { murder: "🔪 Murder", recruit: "🤝 Recruit", ultimatum: "⚠️ Blackmail (join or die)", none: "— No action —" };
+
+// ---------------------------------------------------------------- win odds
+// Simple model: each day one player is banished (Faithful are a bit better than random at
+// spotting Traitors), each night one Faithful is murdered. Game over when no Traitors remain
+// (Faithful win) or Traitors equal/outnumber the Faithful (Traitors win).
+function winChance(T, F) {
+  if (T <= 0) return 100;
+  if (T >= F) return 0;
+  const memo = new Map();
+  const night = (t, f) => (t <= 0 ? 1 : t >= f ? 0 : day(t, f - 1));
+  function day(t, f) {
+    if (t <= 0) return 1;
+    if (t >= f) return 0;
+    const k = t + "," + f;
+    if (memo.has(k)) return memo.get(k);
+    const q = Math.min(0.9, (t / (t + f)) * 1.4);
+    const v = q * night(t - 1, f) + (1 - q) * night(t, f - 1);
+    memo.set(k, v);
+    return v;
+  }
+  return Math.round(day(T, F) * 100);
+}
+const oddsFrom = (T, F) => { const f = winChance(T, F); return { f, t: 100 - f, ts: Date.now() }; };
+function oddsValue(excl = []) {
+  const g = S.game;
+  if (!g || g.phase === "lobby" || g.settings?.showOdds === false) return null;
+  if (!S.secret?.roles || !Object.keys(S.secret.roles).length) return null;
+  const al = alive(g).filter((p) => !excl.includes(p));
+  const T = al.filter((p) => roleOf(p) === "Traitor").length;
+  return oddsFrom(T, al.length - T);
+}
 
 // ---------------------------------------------------------------- boot
 (async function boot() {
@@ -89,14 +121,14 @@ async function createGame(name, currency, pot, password) {
   await setDoc(R.game(code), {
     code, name, gmUid: S.uid, createdAt: Date.now(), phase: "lobby", day: 0, pot, currency,
     players: {}, order: [], missions: [], timer: null, vote: null, reveal: null, banish: null,
-    announce: null, broadcast: null, winner: null, breakfastDone: false, hasPassword: true,
-    settings: { numTraitors: 0, autoTraitorWin: true, daggerEnabled: true, endgameSize: 4, tiedCanVote: false },
+    announce: null, broadcast: null, winner: null, breakfastDone: false, hasPassword: true, odds: null,
+    settings: { numTraitors: 0, autoTraitorWin: true, daggerEnabled: true, endgameSize: 4, tiedCanVote: false, showOdds: true },
     log: [{ t: Date.now(), day: 0, text: `🏰 The castle doors open: ${name}` }],
   });
   const pk = await gmPassKey(code, password);
   await setDoc(R.gmAccess(code, pk), { createdAt: Date.now() });
   await setDoc(R.gmDev(code, S.uid), { key: pk, at: Date.now(), device: navigator.userAgent.slice(0, 120) });
-  await setDoc(R.secret(code), { roles: {}, pins: {}, keys: {}, traitorKey: null, shields: {}, daggers: {}, pendingMurder: null, revealQueue: [], revealResult: null, gmLog: [] });
+  await setDoc(R.secret(code), { roles: {}, pins: {}, keys: {}, traitorKey: null, shields: {}, daggers: {}, pendingMurder: null, pendingMurders: [], revealQueue: [], revealResult: null, gmLog: [] });
   rememberGame(code, name);
   sessionStorage.setItem(unlockKey(code), "1");
   return code;
@@ -112,8 +144,6 @@ async function openGame(code) {
     if (!snap.exists()) return showFatal(`Game ${code} was not found.`);
     g = snap.data();
   } catch (e) { return showFatal(errMsg(e)); }
-  // Password required every time a browser session opens the console.
-  // Games created before GM passwords existed still open on the device that created them.
   const ok = sessionStorage.getItem(unlockKey(code)) === "1" || (!g.hasPassword && g.gmUid === S.uid);
   if (!ok) return showPasswordGate(code, g);
   enterGM(code);
@@ -206,7 +236,6 @@ function syncVoteSub() {
   }, (e) => toast(errMsg(e), "error"));
 }
 
-// Mirror "who has logged in" and "who has voted" onto the public board (no secrets revealed)
 async function mirrorJoined() {
   const g = S.game; if (!g) return;
   const patch = {};
@@ -276,7 +305,7 @@ function renderBcast() {
 function renderSoft() { if (!S.game || !$("#topbar")) return; renderPanel(); renderRoster(); renderChamber(); }
 
 function renderTop() {
-  const g = S.game, c = counts(), started = g.phase !== "lobby";
+  const g = S.game, c = counts(), started = g.phase !== "lobby", o = g.odds, oddsOn = g.settings?.showOdds !== false;
   $("#topbar").innerHTML = `
     <div class="brand"><span class="logo">🗡️</span><div><div class="title">${esc(g.name)}</div><div class="sub">Game code <span class="code">${g.code}</span> · Game Master</div></div></div>
     <div class="stats">
@@ -285,10 +314,12 @@ function renderTop() {
       <div class="stat"><span>Prize pot</span><b class="gold">${money(g.pot, g.currency)}</b></div>
       <div class="stat"><span>Alive</span><b>${c.alive} / ${g.order.length}</b></div>
       ${started && !S.privacy ? `<div class="stat"><span>Faithful / Traitor</span><b>${c.F} / <span class="red">${c.T}</span></b></div>` : ""}
+      ${o ? `<div class="stat"><span>Win chance (public)</span><b><span style="color:#5b9bff">🛡 ${o.f}%</span> · <span class="red">🗡 ${o.t}%</span></b></div>` : ""}
     </div>
     <div class="actions">
       <a class="btn btn-sm" target="_blank" href="${pageUrl("display.html", { g: g.code })}">📺 Big screen</a>
       <button class="btn btn-sm" data-act="copyLink">📱 Player link</button>
+      <button class="btn btn-sm" data-act="toggleOdds" title="Show or hide the win-chance bar on players' Notes tab">📊 Odds ${oddsOn ? "ON" : "OFF"}</button>
       <button class="btn btn-sm" data-act="privacy" title="Hide roles/PINs when people can see your screen">${S.privacy ? "🙈 Privacy ON" : "👁 Privacy OFF"}</button>
       <button class="btn btn-sm btn-ghost" data-act="gmLogout" title="Lock the GM console on this device">🔒 Log out</button>
     </div>`;
@@ -326,6 +357,17 @@ function statusBox() {
   return html;
 }
 
+// ---------------------------------------------------------------- night action card
+const slotCard = (n) => `<div class="card" style="margin:0">
+  <h3>Action ${n}</h3>
+  <label>What<select data-slot="${n}" data-role="type">${Object.entries(ACT_TYPES).map(([v, l]) => `<option value="${v}">${l}</option>`).join("")}</select></label>
+  <div data-dyn="noms${n}"></div>
+  <label style="margin-top:8px">Target<select data-slot="${n}" data-role="target"></select></label>
+  <div class="btn-row" data-dyn="btns${n}"></div>
+  <div data-dyn="res${n}"></div>
+</div>`;
+const allPending = (s) => [...(s?.pendingMurders || []), ...(s?.pendingMurder ? [s.pendingMurder] : [])];
+
 // ---------------------------------------------------------------- PANELS
 const PANELS = {
   // ------------------------------------------------ LOBBY
@@ -356,6 +398,7 @@ const PANELS = {
             <label class="check"><input type="checkbox" name="autoTraitorWin" ${st.autoTraitorWin !== false ? "checked" : ""}> Traitors win when they equal / outnumber the Faithful</label>
             <label class="check"><input type="checkbox" name="daggerEnabled" ${st.daggerEnabled !== false ? "checked" : ""}> Enable the Dagger (one-time double vote won in missions)</label>
             <label class="check"><input type="checkbox" name="tiedCanVote" ${st.tiedCanVote ? "checked" : ""}> Tied players may vote in a tie-break revote</label>
+            <label class="check"><input type="checkbox" name="showOdds" ${st.showOdds !== false ? "checked" : ""}> Show the win-chance bar (Faithful vs Traitors) to players</label>
             <label>Currency symbol<input name="currency" value="${esc(g.currency || "₹")}" maxlength="3"></label>
             <button class="btn" type="submit">💾 Save settings</button>
           </form>
@@ -369,7 +412,7 @@ const PANELS = {
           await upd({
             currency: fd.get("currency").trim() || "₹",
             settings: { numTraitors: Number(fd.get("numTraitors")) || 0, endgameSize: Math.max(2, Number(fd.get("endgameSize")) || 4),
-              autoTraitorWin: !!fd.get("autoTraitorWin"), daggerEnabled: !!fd.get("daggerEnabled"), tiedCanVote: !!fd.get("tiedCanVote") }
+              autoTraitorWin: !!fd.get("autoTraitorWin"), daggerEnabled: !!fd.get("daggerEnabled"), tiedCanVote: !!fd.get("tiedCanVote"), showOdds: !!fd.get("showOdds") }
           });
           toast("Settings saved", "ok");
         } catch (err) { toast(errMsg(err), "error"); }
@@ -415,14 +458,16 @@ const PANELS = {
     key: () => String(S.game.day),
     build(el) { el.innerHTML = `<h2>☕ Breakfast — Day ${S.game.day}</h2><div data-dyn="b"></div>`; },
     update(el) {
-      const g = S.game, pm = S.secret?.pendingMurder;
+      const g = S.game, list = allPending(S.secret);
       let html = "";
       if (!g.breakfastDone) {
-        const who = pm ? (S.privacy ? "<i>(hidden — privacy mode)</i>" : `<b>${esc(pname(g, pm.pid))}</b>`) : "";
-        html += pm ? (pm.blocked
-          ? `<div class="alert alert-blue">🛡 The Traitors targeted ${who}, but a Shield saved them. <b>Nobody died.</b> (Players will only learn that everyone survived.)</div>`
-          : `<div class="alert alert-red">🔪 ${who} was murdered last night${pm.ultimatum ? " (refused the ultimatum)" : ""}.</div>`)
-          : `<div class="alert">No murder was recorded last night.</div>`;
+        if (!list.length) html += `<div class="alert">No murder was recorded last night.</div>`;
+        list.forEach((pm) => {
+          const who = S.privacy ? "<i>(hidden — privacy mode)</i>" : `<b>${esc(pname(g, pm.pid))}</b>`;
+          html += pm.blocked
+            ? `<div class="alert alert-blue">🛡 The Traitors targeted ${who}, but a Shield saved them. <b>They survive.</b></div>`
+            : `<div class="alert alert-red">🔪 ${who} was murdered last night${pm.ultimatum ? " (refused the blackmail)" : ""}.</div>`;
+        });
         html += `<p class="muted">Tip: let players walk into breakfast in small groups to build tension, then reveal on all screens.</p>
           <button class="btn btn-primary btn-lg" data-act="revealBreakfast">🔔 Reveal the night's outcome</button>`;
       } else {
@@ -578,7 +623,7 @@ const PANELS = {
       const nm = esc(pname(g, b.pid)), role = roleOf(b.pid);
       el.innerHTML = b.roleRevealed
         ? `<h2>⚖️ ${nm} was ${role === "Traitor" ? "a TRAITOR 🗡" : "FAITHFUL 🛡"}</h2>
-           ${role === "Traitor" ? `<p>A Traitor has been caught! ${counts().T > 0 ? "The remaining Traitors may <b>recruit</b> a new Traitor tonight." : ""}</p>` : `<p>The Round Table banished one of their own…</p>`}
+           ${role === "Traitor" ? `<p>A Traitor has been caught! ${counts().T > 0 ? "The remaining Traitors may <b>recruit</b> or <b>blackmail</b> a new Traitor tonight." : ""}</p>` : `<p>The Round Table banished one of their own…</p>`}
            <div data-dyn="s"></div>
            <div class="btn-row"><button class="btn btn-primary" data-act="go" data-phase="night">🌙 Night falls</button><button class="btn" data-act="go" data-phase="endgame">🔥 Endgame</button></div>`
         : `<h2>⚖️ ${nm} has been banished</h2>
@@ -590,64 +635,85 @@ const PANELS = {
     update(el) { dyn(el, "s", statusBox()); },
   },
 
-  // ------------------------------------------------ NIGHT
+  // ------------------------------------------------ NIGHT (up to 2 actions)
   night: {
     key: () => S.chamber?.nightId || "",
     build(el) {
       const g = S.game;
       el.innerHTML = `
       <h2>🌙 Night ${g.day}</h2>
-      <p class="muted">Faithfuls sleep. The Traitors confer in their hidden room on their phones (or meet you in person). Their nominations appear below — you confirm the outcome.</p>
-      <label>Tonight the Traitors will…
-        <select id="nightMode">
-          <option value="murder">🔪 Murder a Faithful</option>
-          <option value="recruit">🤝 Recruit — offer a Faithful to join them</option>
-          <option value="ultimatum">⚠️ Recruit by ultimatum — join or be murdered</option>
-        </select></label>
-      <div data-dyn="noms"></div>
-      <label style="margin-top:10px">Target<select id="nightTarget"></select></label>
-      <div class="btn-row" data-dyn="btns"></div>
+      <p class="muted">The Traitors may take up to <b>2 actions</b> tonight — any combination of <b>murder</b>, <b>recruit</b> or <b>blackmail</b> (join or be murdered). They pick on their phones in their hidden room; you confirm each action here. Choose “No action” to skip one.</p>
+      <div class="grid2">${slotCard(1)}${slotCard(2)}</div>
       <div data-dyn="status"></div>
       <div class="btn-row" style="margin-top:18px"><button class="btn btn-primary btn-lg" data-act="go" data-phase="breakfast">🌅 Morning comes → Breakfast (Day ${g.day + 1})</button></div>`;
-      el.querySelector("#nightMode").onchange = (e) => run(() => updateDoc(R.chamber(S.code, S.chamberKey), {
-        mode: e.target.value,
-        status: e.target.value === "murder" ? "Choose who will not wake up tomorrow." : e.target.value === "recruit" ? "Tonight you may RECRUIT. Nominate the Faithful you want to invite." : "Tonight you issue an ULTIMATUM: join us, or die. Nominate your target.",
-      }));
+      el.querySelectorAll("select[data-slot]").forEach((s) => s.addEventListener("change", () => { s.dataset.touched = "1"; PANELS.night.update(el); }));
     },
     update(el) {
-      const g = S.game, ch = S.chamber || {}, s = S.secret || {};
-      const modeSel = el.querySelector("#nightMode");
-      if (modeSel && document.activeElement !== modeSel && ch.mode) modeSel.value = ch.mode;
-      const noms = S.noms.filter((n) => n.nightId && n.nightId === ch.nightId);
-      const t = {}; noms.forEach((n) => (t[n.target] = (t[n.target] || 0) + 1));
-      const top = Object.entries(t).sort((a, b) => b[1] - a[1])[0]?.[0];
-      const priv = S.privacy;
-      dyn(el, "noms", `<h3>Traitor nominations</h3>${priv ? `<p class="muted">Hidden — privacy mode.</p>` : noms.length ? `<ul class="log">${noms.map((n) => `<li>🗡 <b>${esc(pname(g, n.id))}</b> ➜ ${esc(pname(g, n.target))}</li>`).join("")}</ul>
-        <p>Leading: <b class="red">${top ? esc(pname(g, top)) : "—"}</b> ${top ? `(${t[top]} of ${alive(g).filter((p) => roleOf(p) === "Traitor").length} living Traitors)` : ""}</p>` : `<p class="muted">No nominations yet.</p>`}`);
-      // target select (living Faithful only)
-      const sel = el.querySelector("#nightTarget");
-      if (sel && document.activeElement !== sel) {
-        const opts = alive(g).filter((p) => roleOf(p) !== "Traitor");
-        const cur = sel.value; const sig = opts.join(",") + priv;
-        if (sel.dataset.sig !== sig) {
-          sel.dataset.sig = sig;
-          sel.innerHTML = `<option value="">— choose —</option>` + opts.map((p) => `<option value="${p}">${esc(pname(g, p))}${s.shields?.[p] && !priv ? " 🛡" : ""}</option>`).join("");
+      const g = S.game, ch = S.chamber || {}, s = S.secret || {}, priv = S.privacy;
+      const acts = ch.acts || {};
+      const nm = (p) => (priv ? "(hidden)" : esc(pname(g, p)));
+      const noms = S.noms.filter((n) => n.nightId && n.nightId === ch.nightId)
+        .map((n) => ({ by: n.by || n.id, slot: Number(n.slot) || 1, type: n.type || n.mode || "murder", target: n.target || "" }));
+      const liveT = alive(g).filter((p) => roleOf(p) === "Traitor").length;
+      const faithful = alive(g).filter((p) => roleOf(p) !== "Traitor");
+      for (const n of [1, 2]) {
+        const a = acts[n] && acts[n].nightId === ch.nightId ? acts[n] : null;
+        const o = acts[n === 1 ? 2 : 1];
+        const otherPid = o && o.nightId === ch.nightId && o.type !== "none" ? o.pid : null;
+        const mine = noms.filter((x) => x.slot === n);
+        const tally = {}; mine.forEach((x) => { const k = x.type + "|" + x.target; tally[k] = (tally[k] || 0) + 1; });
+        const top = Object.entries(tally).sort((x, y) => y[1] - x[1])[0];
+        const [topType, topTarget] = top ? top[0].split("|") : [null, null];
+        dyn(el, "noms" + n, priv ? `<p class="muted small">Nominations hidden — privacy mode.</p>`
+          : mine.length ? `<ul class="log">${mine.map((x) => `<li>🗡 <b>${esc(pname(g, x.by))}</b> ➜ ${ACT_TYPES[x.type] || esc(x.type)}${x.type !== "none" && x.target ? `: <b>${esc(pname(g, x.target))}</b>` : ""}</li>`).join("")}</ul>
+            <p class="small">Leading: <b class="red">${ACT_TYPES[topType] || ""}${topType !== "none" && topTarget ? " — " + esc(pname(g, topTarget)) : ""}</b> (${top[1]} of ${liveT} living Traitors)</p>`
+          : `<p class="muted small">No nominations yet.</p>`);
+
+        const typeSel = el.querySelector(`select[data-slot="${n}"][data-role="type"]`);
+        const tgtSel = el.querySelector(`select[data-slot="${n}"][data-role="target"]`);
+        if (typeSel && document.activeElement !== typeSel && (a || !typeSel.dataset.touched)) typeSel.value = a?.type || topType || (n === 1 ? "murder" : "none");
+        const type = typeSel?.value || "murder";
+        if (tgtSel && document.activeElement !== tgtSel) {
+          const list = a?.pid ? [a.pid] : faithful.filter((p) => p !== otherPid);
+          const sig = list.join(",") + "|" + priv + "|" + JSON.stringify(s.shields || {});
+          if (tgtSel.dataset.sig !== sig) {
+            const cur = tgtSel.value;
+            tgtSel.dataset.sig = sig;
+            tgtSel.innerHTML = `<option value="">— choose —</option>` + list.map((p) => `<option value="${p}">${nm(p)}${s.shields?.[p] && !priv ? " 🛡" : ""}</option>`).join("");
+            tgtSel.value = cur;
+          }
+          if (a?.pid) tgtSel.value = a.pid;
+          else if (!tgtSel.dataset.touched || !list.includes(tgtSel.value)) tgtSel.value = topTarget && list.includes(topTarget) ? topTarget : "";
         }
-        sel.value = opts.includes(cur) ? cur : (top && opts.includes(top) ? top : "");
+        if (typeSel) typeSel.disabled = !!a;
+        if (tgtSel) tgtSel.disabled = !!a || type === "none";
+
+        const goLabel = { murder: "🔪 Confirm murder", recruit: "🤝 Send recruitment offer", ultimatum: "⚠️ Send blackmail", none: "✔ No action tonight" }[type];
+        dyn(el, "btns" + n, a
+          ? (a.state === "accepted" ? "" : `<button class="btn btn-ghost" data-act="undoAct" data-slot="${n}">↩ Undo action ${n}</button>`)
+          : `<button class="btn ${type === "murder" ? "btn-danger" : "btn-primary"}" data-act="nightAct" data-slot="${n}">${goLabel}</button>`);
+
+        let r = "";
+        if (a) {
+          const who = a.pid ? `<b>${nm(a.pid)}</b>` : "";
+          const pv = a.pid ? S.privs[a.pid] : null;
+          if (a.type === "none") r = `<div class="alert">✔ No action taken.</div>`;
+          else if (a.type === "murder") r = a.blocked
+            ? `<div class="alert alert-blue">🛡 ${who} holds a Shield — this murder will FAIL.</div>`
+            : `<div class="alert alert-red">🔪 ${who} will be found murdered at breakfast.</div>`;
+          else {
+            const st = a.state === "accepted" ? "✅ ACCEPTED — now a Traitor"
+              : a.state === "refused" ? (a.type === "ultimatum" ? "❌ REFUSED — will be murdered at breakfast" : "❌ REFUSED")
+              : pv?.offerResponse ? (pv.offerResponse === "accept" ? "✅ accepted (processing…)" : "❌ refused (processing…)")
+              : "⏳ awaiting answer…";
+            r = `<div class="alert">${a.type === "ultimatum" ? "⚠️ Blackmail" : "🤝 Recruitment offer"} to ${who}: ${st}</div>`;
+          }
+        }
+        dyn(el, "res" + n, r);
       }
-      const mode = ch.mode || "murder";
-      dyn(el, "btns", mode === "murder"
-        ? `<button class="btn btn-danger" data-act="confirmMurder">🔪 Confirm murder</button><button class="btn btn-ghost" data-act="noMurder">🕊 No murder tonight</button>`
-        : `<button class="btn btn-primary" data-act="sendOffer">${mode === "ultimatum" ? "⚠️ Send ultimatum" : "🤝 Send recruitment offer"}</button>`);
       let st = "";
-      const pm = s.pendingMurder;
-      if (pm && pm.day === g.day) st += `<div class="alert ${pm.blocked ? "alert-blue" : "alert-red"}">${pm.blocked ? "🛡" : "🔪"} Tonight's outcome: <b>${priv ? "(hidden)" : esc(pname(g, pm.pid))}</b> ${pm.blocked ? "was targeted but is SHIELDED — nobody will die." : "will be found murdered at breakfast."}</div>`;
-      Object.entries(S.privs).forEach(([p, pv]) => {
-        if (pv?.offer && pv.offer.day === g.day) {
-          const resp = pv.offerResponse ? (pv.offerResponse === "accept" ? "✅ ACCEPTED" : "❌ DECLINED") : "⏳ awaiting answer…";
-          st += `<div class="alert">${pv.offer.type === "ultimatum" ? "⚠️ Ultimatum" : "🤝 Recruitment offer"} to <b>${priv ? "(hidden)" : esc(pname(g, p))}</b>: ${resp}</div>`;
-        }
-      });
+      const pms = allPending(s);
+      if (pms.length) st += `<p class="small">Breakfast will reveal: ${pms.map((pm) => `${pm.blocked ? "🛡" : "🔪"} ${nm(pm.pid)}${pm.blocked ? " (shielded — survives)" : ""}`).join(" · ")}</p>`;
       if (ch.status && !priv) st += `<p class="tiny">Traitors see: “${esc(ch.status)}”</p>`;
       dyn(el, "status", st);
     },
@@ -732,7 +798,7 @@ function renderChamber() {
   const ct = el.querySelector('[data-dyn="ct"]'), chat = el.querySelector('[data-dyn="chat"]');
   if (S.privacy) { ct.innerHTML = `<p class="muted">Hidden — privacy mode is on.</p>`; chat.innerHTML = ""; return; }
   const traitors = g.order.filter((p) => roleOf(p) === "Traitor");
-  ct.innerHTML = `<p class="small">Traitors: ${traitors.map((p) => `<b class="${g.players[p]?.status === "alive" ? "red" : "dim"}">${esc(pname(g, p))}</b>`).join(", ") || "—"} · Mode: <b>${esc(S.chamber?.mode || "—")}</b></p>`;
+  ct.innerHTML = `<p class="small">Traitors: ${traitors.map((p) => `<b class="${g.players[p]?.status === "alive" ? "red" : "dim"}">${esc(pname(g, p))}</b>`).join(", ") || "—"}</p>`;
   const atBottom = chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 20;
   chat.innerHTML = S.msgs.length ? S.msgs.map((m) => `<div class="msg ${m.system ? "sys" : ""}"><b>${esc(m.name)}:</b> ${esc(m.text)}</div>`).join("") : `<p class="muted small">No messages yet.</p>`;
   if (atBottom) chat.scrollTop = chat.scrollHeight;
@@ -764,6 +830,11 @@ const ACT = {
   privacy() { S.privacy = !S.privacy; localStorage.setItem("traitors.gm.privacy", S.privacy ? "1" : "0"); S.chamberBuiltFor = null; render(); },
   copyLink() { return copyText(pageUrl("play.html", { g: S.code })); },
   async clearBroadcast() { await upd({ broadcast: null }); toast("Message cleared from all screens", "ok"); },
+  async toggleOdds() {
+    const on = S.game.settings?.showOdds === false;
+    await upd({ "settings.showOdds": on, odds: on ? oddsValue() : null });
+    toast(on ? "Win-chance bar is now shown to players" : "Win-chance bar is now hidden from players", "ok");
+  },
   async gmLogout() {
     if (!await confirmBox("Log out of the GM console?", "This device will need the GM password to open the console again. The game keeps running.", "Log out")) return;
     sessionStorage.removeItem(unlockKey(S.code));
@@ -830,15 +901,8 @@ const ACT = {
 
   // breakfast / night
   revealBreakfast: () => revealBreakfast(),
-  confirmMurder: () => confirmMurder(),
-  async noMurder() {
-    if (!await confirmBox("No murder tonight?", "Everyone will survive the night.", "Confirm")) return;
-    const b = writeBatch(db);
-    b.update(R.secret(S.code), { pendingMurder: null, gmLog: arrayUnion(L(`Night ${S.game.day}: no murder.`)) });
-    b.update(R.chamber(S.code, S.chamberKey), { status: "There will be no murder tonight." });
-    await b.commit();
-  },
-  sendOffer: () => sendOffer(),
+  nightAct: (b) => nightAct(Number(b.dataset.slot) || 1),
+  undoAct: (b) => undoAct(Number(b.dataset.slot) || 1),
   appointTraitor: () => appointTraitor(),
 
   // end
@@ -852,13 +916,16 @@ async function goPhase(p) {
   const g = S.game;
   if (p === g.phase && p !== "night") return;
   if (g.vote?.open && !await confirmBox("Leave the vote?", "A vote is still open. Moving on will abandon it.", "Leave anyway", true)) return;
-  if (p === "night" && g.phase === "night" && !await confirmBox("Restart the night?", "This clears tonight's nominations and starts the night again.", "Restart night")) return;
+  if (p === "night" && g.phase === "night" && !await confirmBox("Restart the night?", "This clears tonight's nominations and actions and starts the night again.", "Restart night")) return;
   const patch = { phase: p };
   if (g.vote?.open) patch.vote = null;
   if (p === "night") {
     if (!S.chamberKey) return toast("Assign roles first.", "error");
-    await updateDoc(R.chamber(S.code, S.chamberKey), { mode: "murder", nightId: randStr(8), day: g.day, status: "Night has fallen. Discuss, then nominate who will not wake up tomorrow." });
-    await setDoc(R.newMsg(S.code, S.chamberKey), { from: "GM", name: "Game Master", system: true, text: `🌙 Night ${g.day} has begun. Make your nominations.`, ts: Date.now() });
+    await updateDoc(R.chamber(S.code, S.chamberKey), {
+      mode: "dual", nightId: randStr(8), day: g.day, acts: {},
+      status: "Night has fallen. You may take up to 2 actions tonight — any mix of murder, recruit or blackmail. Make your picks.",
+    });
+    await setDoc(R.newMsg(S.code, S.chamberKey), { from: "GM", name: "Game Master", system: true, text: `🌙 Night ${g.day} has begun. You may take up to 2 actions tonight. Make your picks.`, ts: Date.now() });
     patch.announce = ann("night", { text: "🌙 Night falls on the castle… Faithfuls, sleep well." });
     patch.timer = null; patch.log = arrayUnion(L(`🌙 Night ${g.day} fell.`));
   }
@@ -910,7 +977,6 @@ async function addLatePlayer() {
   const invite = `🗡 THE TRAITORS — ${g.name}\nHi ${name}! Tap your personal link to join:\n${link}\n\nGame code: ${g.code}\nYour secret PIN: ${pin}\n🤫 Do not share this link or PIN with anyone.`;
   const publicPlayer = { name, status: "alive", joined: false, revealedRole: null, shieldPublic: false, eliminatedDay: null };
 
-  // Lobby: no role yet — roles are assigned when the game starts.
   if (g.phase === "lobby" || !s.roles || !Object.keys(s.roles).length) {
     const b = writeBatch(db);
     b.update(R.secret(S.code), { [`pins.${pid}`]: pin, [`keys.${pid}`]: key });
@@ -921,7 +987,6 @@ async function addLatePlayer() {
     return copyText(invite);
   }
 
-  // Mid-game: choose the role
   const choice = await modal({
     title: `🎭 Role for ${esc(name)}`,
     body: "How should this player's role be decided? Only you (the Game Master) will see the result.",
@@ -953,7 +1018,7 @@ async function addLatePlayer() {
   };
   if (isT && !tKey) {
     tKey = randHex(16); sp.traitorKey = tKey;
-    b.set(R.chamber(S.code, tKey), { mode: "murder", nightId: null, day: g.day, status: "", createdAt: Date.now() });
+    b.set(R.chamber(S.code, tKey), { mode: "dual", nightId: null, day: g.day, acts: {}, status: "", createdAt: Date.now() });
   }
   const roles = { ...(s.roles || {}), [pid]: role };
   const tIds = [...g.order, pid].filter((p) => roles[p] === "Traitor");
@@ -1026,14 +1091,15 @@ async function startGame() {
   pids.forEach((p) => (roles[p] = traitors.includes(p) ? "Traitor" : "Faithful"));
   const fellows = traitors.map((p) => ({ pid: p, name: pname(g, p) }));
   const b = writeBatch(db);
-  b.update(R.secret(S.code), { roles, traitorKey: tKey, shields: {}, daggers: {}, pendingMurder: null, revealQueue: [], revealResult: null, gmLog: arrayUnion(L(`🎭 Traitors chosen: ${fellows.map((f) => f.name).join(", ")}`)) });
+  b.update(R.secret(S.code), { roles, traitorKey: tKey, shields: {}, daggers: {}, pendingMurder: null, pendingMurders: [], revealQueue: [], revealResult: null, gmLog: arrayUnion(L(`🎭 Traitors chosen: ${fellows.map((f) => f.name).join(", ")}`)) });
   pids.forEach((p) => {
     const isT = roles[p] === "Traitor";
     b.update(R.priv(S.code, keyOf(p)), { role: roles[p], traitorKey: isT ? tKey : deleteField(), fellows: isT ? fellows : [], seenRole: false, shield: false, dagger: false, offer: null, offerResponse: null, notice: null });
   });
-  b.set(R.chamber(S.code, tKey), { mode: "murder", nightId: null, day: 1, status: "Welcome, Traitors. When night falls, you will choose who does not wake up.", createdAt: Date.now() });
+  b.set(R.chamber(S.code, tKey), { mode: "dual", nightId: null, day: 1, acts: {}, status: "Welcome, Traitors. When night falls, you may take up to 2 actions each night.", createdAt: Date.now() });
   b.update(R.game(S.code), {
     phase: "roles", day: 1, startedAt: Date.now(), breakfastDone: false,
+    odds: g.settings?.showOdds === false ? null : oddsFrom(traitors.length, n - traitors.length),
     log: arrayUnion(L(`🎭 The game has begun with ${n} players. ${traitors.length} Traitor(s) walk among you.`)),
     announce: ann("text", { text: "🎭 Roles have been assigned. Check your phone — in private!" }),
   });
@@ -1131,7 +1197,7 @@ async function refreshFellows(rolesOverride = null) {
 async function convertToTraitor(pid, opts = {}) {
   const g = S.game, s = S.secret; let key = s.traitorKey; const b = writeBatch(db);
   const sp = { [`roles.${pid}`]: "Traitor", gmLog: arrayUnion(L(`🗡 ${pname(g, pid)} became a Traitor${opts.via ? ` (${opts.via})` : ""}.`)) };
-  if (!key) { key = randHex(16); sp.traitorKey = key; b.set(R.chamber(S.code, key), { mode: "murder", nightId: null, day: g.day, status: "", createdAt: Date.now() }); }
+  if (!key) { key = randHex(16); sp.traitorKey = key; b.set(R.chamber(S.code, key), { mode: "dual", nightId: null, day: g.day, acts: {}, status: "", createdAt: Date.now() }); }
   const roles = { ...s.roles, [pid]: "Traitor" };
   const traitors = g.order.filter((p) => roles[p] === "Traitor" && keyOf(p));
   const fellows = traitors.map((p) => ({ pid: p, name: pname(g, p) }));
@@ -1192,7 +1258,7 @@ async function closeVote() {
     if (valid && v.kind === "banish" && x.dagger && s.daggers?.[p]) { weight = 2; daggerUse.push(p); }
     items.push({ voter: p, target: valid ? x.target : null, weight, dagger: weight === 2, note: valid ? "" : "Invalid vote" });
   }
-  items.sort((a, b) => (a.target ? 0 : 1) - (b.target ? 0 : 1)); // no-votes last
+  items.sort((a, b) => (a.target ? 0 : 1) - (b.target ? 0 : 1));
   const tally = {}; items.forEach((i) => { if (i.target) tally[i.target] = (tally[i.target] || 0) + i.weight; });
   const max = Math.max(0, ...Object.values(tally)), tops = Object.keys(tally).filter((k) => tally[k] === max);
   const result = max === 0 ? { type: "none", ids: [] } : tops.length === 1 ? { type: "single", ids: tops } : { type: "tie", ids: tops };
@@ -1233,60 +1299,99 @@ async function revealRole() {
   const role = roleOf(pid) || "Faithful", nm = pname(g, pid);
   await upd({
     "banish.roleRevealed": true, [`players.${pid}.revealedRole`]: role,
+    odds: oddsValue([pid]),
     announce: ann("role", { pid, name: nm, role }),
     log: arrayUnion(L(`🎭 ${nm} was ${role === "Traitor" ? "a TRAITOR" : "FAITHFUL"}.`)),
   });
 }
 
-// ---------------------------------------------------------------- night
-async function confirmMurder() {
-  const g = S.game, s = S.secret, pid = $("#nightTarget")?.value;
+// ---------------------------------------------------------------- night (up to 2 actions)
+async function nightAct(slot) {
+  const g = S.game, ch = S.chamber || {}, el = $("#panel");
+  if (!S.chamberKey || !ch.nightId) return toast("Start the night first.", "error");
+  const acts = ch.acts || {};
+  if (acts[slot] && acts[slot].nightId === ch.nightId) return toast("This action is already done. Undo it first.", "error");
+  const type = el.querySelector(`select[data-slot="${slot}"][data-role="type"]`)?.value || "murder";
+  const chRef = R.chamber(S.code, S.chamberKey);
+  if (type === "none") {
+    await updateDoc(chRef, { [`acts.${slot}`]: { type: "none", state: "none", nightId: ch.nightId, ts: Date.now() } });
+    return;
+  }
+  const pid = el.querySelector(`select[data-slot="${slot}"][data-role="target"]`)?.value;
   if (!pid) return toast("Choose a target.", "error");
-  if (roleOf(pid) === "Traitor") return toast("Traitors cannot murder a Traitor.", "error");
-  const blocked = !!s.shields?.[pid], nm = pname(g, pid);
-  if (!await confirmBox("Confirm the murder", `${esc(nm)} ${blocked ? "holds a 🛡 <b>Shield</b> — the murder will FAIL and nobody dies." : "will be found murdered at breakfast."}`, blocked ? "Confirm (blocked)" : "🔪 Confirm", !blocked)) return;
+  if (g.players[pid]?.status !== "alive") return toast("That player is no longer in the game.", "error");
+  if (roleOf(pid) === "Traitor") return toast("That player is already a Traitor.", "error");
+  const other = acts[slot === 1 ? 2 : 1];
+  if (other && other.nightId === ch.nightId && other.pid === pid) return toast("The other action already targets this player.", "error");
+  const nm = pname(g, pid);
   const b = writeBatch(db);
-  b.update(R.secret(S.code), { pendingMurder: { pid, blocked, day: g.day }, gmLog: arrayUnion(L(`🔪 Night ${g.day}: Traitors chose ${nm}${blocked ? " — BLOCKED by a shield" : ""}.`)) });
-  const msg = blocked ? `🛡 ${nm} was protected by a Shield. Your murder attempt has FAILED.` : `🔪 It is done. ${nm} will not wake up tomorrow.`;
-  b.update(R.chamber(S.code, S.chamberKey), { status: msg });
-  b.set(R.newMsg(S.code, S.chamberKey), { from: "GM", name: "Game Master", system: true, text: msg, ts: Date.now() });
+  if (type === "murder") {
+    const blocked = !!S.secret.shields?.[pid];
+    if (!await confirmBox(`Action ${slot}: confirm the murder`, `${esc(nm)} ${blocked ? "holds a 🛡 <b>Shield</b> — the murder will FAIL and they survive." : "will be found murdered at breakfast."}`, blocked ? "Confirm (blocked)" : "🔪 Confirm", !blocked)) return;
+    const list = (S.secret.pendingMurders || []).filter((x) => !(x.slot === slot && x.day === g.day));
+    list.push({ pid, blocked, day: g.day, slot });
+    b.update(R.secret(S.code), { pendingMurders: list, gmLog: arrayUnion(L(`🔪 Night ${g.day}, action ${slot}: murder ${nm}${blocked ? " — BLOCKED by a shield" : ""}.`)) });
+    const msg = blocked ? `🛡 Action ${slot}: ${nm} was protected by a Shield. The murder FAILED.` : `🔪 Action ${slot}: it is done. ${nm} will not wake up tomorrow.`;
+    b.update(chRef, { [`acts.${slot}`]: { type, pid, name: nm, state: "murder", blocked, nightId: ch.nightId, ts: Date.now() }, status: msg });
+    b.set(R.newMsg(S.code, S.chamberKey), { from: "GM", name: "Game Master", system: true, text: msg, ts: Date.now() });
+  } else {
+    const pv = S.privs[pid];
+    if (pv?.offer && !pv.offer.handled && pv.offer.day === g.day) return toast(`${nm} already has an open offer tonight.`, "error");
+    const label = type === "ultimatum" ? "blackmail (join or be murdered)" : "recruitment offer";
+    if (!await confirmBox(`Action ${slot}: send ${label}?`, `${esc(nm)} will see a private prompt on their phone${type === "ultimatum" ? ": join the Traitors, or be murdered tonight." : " inviting them to join the Traitors."}`, "Send")) return;
+    b.update(R.priv(S.code, keyOf(pid)), { offer: { type, ts: Date.now(), day: g.day, handled: false, slot }, offerResponse: null });
+    const msg = `${type === "ultimatum" ? "⚠️ Blackmail" : "🤝 Offer"} sent to ${nm} (action ${slot}). Awaiting their answer…`;
+    b.update(chRef, { [`acts.${slot}`]: { type, pid, name: nm, state: "offered", nightId: ch.nightId, ts: Date.now() }, status: msg });
+    b.set(R.newMsg(S.code, S.chamberKey), { from: "GM", name: "Game Master", system: true, text: msg, ts: Date.now() });
+    b.update(R.secret(S.code), { gmLog: arrayUnion(L(`${type === "ultimatum" ? "⚠️ Blackmail" : "🤝 Recruitment offer"} sent to ${nm} (night ${g.day}, action ${slot}).`)) });
+  }
   await b.commit();
 }
 
-async function sendOffer() {
-  const g = S.game, pid = $("#nightTarget")?.value, mode = S.chamber?.mode;
-  if (!pid) return toast("Choose who to approach.", "error");
-  if (roleOf(pid) === "Traitor") return toast("That player is already a Traitor.", "error");
-  const nm = pname(g, pid);
-  if (!await confirmBox(mode === "ultimatum" ? "Send ultimatum?" : "Send recruitment offer?", `${esc(nm)} will see a private prompt on their phone${mode === "ultimatum" ? ": join the Traitors, or be murdered." : " inviting them to join the Traitors."}`, "Send")) return;
+async function undoAct(slot) {
+  const g = S.game, ch = S.chamber || {}, a = (ch.acts || {})[slot];
+  if (!a) return;
+  if (a.state === "accepted") return toast("Can't undo — they have already joined the Traitors.", "error");
+  if (!await confirmBox(`Undo action ${slot}?`, "This cancels the action so you (and the Traitors) can choose again.", "↩ Undo")) return;
   const b = writeBatch(db);
-  b.update(R.priv(S.code, keyOf(pid)), { offer: { type: mode, ts: Date.now(), day: g.day, handled: false }, offerResponse: null });
-  b.update(R.chamber(S.code, S.chamberKey), { status: `${mode === "ultimatum" ? "⚠️ Ultimatum" : "🤝 Offer"} sent to ${nm}. Awaiting their answer…` });
-  b.update(R.secret(S.code), { gmLog: arrayUnion(L(`${mode === "ultimatum" ? "⚠️ Ultimatum" : "🤝 Recruitment offer"} sent to ${nm}.`)) });
+  b.update(R.chamber(S.code, S.chamberKey), { [`acts.${slot}`]: deleteField(), status: `Action ${slot} has been reopened by the Game Master.` });
+  b.update(R.secret(S.code), {
+    pendingMurders: (S.secret.pendingMurders || []).filter((x) => !(x.slot === slot && x.day === g.day)),
+    gmLog: arrayUnion(L(`↩ Night ${g.day}: action ${slot} undone.`)),
+  });
+  if (a.pid && (a.type === "recruit" || a.type === "ultimatum") && keyOf(a.pid)) {
+    const pv = S.privs[a.pid];
+    if (pv?.offer && !pv.offer.handled) b.update(R.priv(S.code, keyOf(a.pid)), { offer: null, offerResponse: null });
+  }
   await b.commit();
 }
 
 async function handleOffer(pid) {
   const pv = S.privs[pid]; if (!pv?.offer || pv.offer.handled || !pv.offerResponse || !S.secret || !S.game) return;
   const tag = pid + "|" + pv.offer.ts; if (S.handledOffers.has(tag)) return; S.handledOffers.add(tag);
-  const g = S.game, nm = pname(g, pid), type = pv.offer.type;
+  const g = S.game, nm = pname(g, pid), type = pv.offer.type, slot = pv.offer.slot || 1;
   try {
     const fresh = (await getDoc(R.priv(S.code, keyOf(pid)))).data();
     if (!fresh?.offer || fresh.offer.handled) return; // already processed by another GM device
     if (pv.offerResponse === "accept") {
-      await convertToTraitor(pid, { offerHandled: true, via: type === "ultimatum" ? "accepted ultimatum" : "accepted recruitment", notice: "You have joined the TRAITORS. Open the 📝 Notes tab and press-and-hold the “My notes” title for 1 second." });
+      await convertToTraitor(pid, { offerHandled: true, via: type === "ultimatum" ? "accepted blackmail" : "accepted recruitment", notice: "You have joined the TRAITORS. Open the 📝 Notes tab and press-and-hold the “My notes” title for 1 second." });
+      if (S.secret.traitorKey) await updateDoc(R.chamber(S.code, S.secret.traitorKey), { [`acts.${slot}.state`]: "accepted" }).catch(() => {});
       toast(`${nm} ACCEPTED and is now a Traitor`, "ok", 6000);
     } else {
       const b = writeBatch(db);
+      const chRef = R.chamber(S.code, S.chamberKey);
       b.update(R.priv(S.code, keyOf(pid)), { "offer.handled": true });
       if (type === "ultimatum") {
-        b.update(R.secret(S.code), { pendingMurder: { pid, blocked: false, ultimatum: true, day: g.day }, gmLog: arrayUnion(L(`⚠️ ${nm} refused the ultimatum and will be murdered.`)) });
-        b.update(R.chamber(S.code, S.chamberKey), { status: `${nm} refused your ultimatum. They will not wake up tomorrow.` });
-        b.set(R.newMsg(S.code, S.chamberKey), { from: "GM", name: "Game Master", system: true, text: `⚠️ ${nm} refused the ultimatum — and has paid the price.`, ts: Date.now() });
+        const day = pv.offer.day ?? g.day;
+        const list = (S.secret.pendingMurders || []).filter((x) => !(x.slot === slot && x.day === day));
+        list.push({ pid, blocked: false, ultimatum: true, day, slot });
+        b.update(R.secret(S.code), { pendingMurders: list, gmLog: arrayUnion(L(`⚠️ ${nm} refused the blackmail and will be murdered.`)) });
+        b.update(chRef, { [`acts.${slot}.state`]: "refused", status: `${nm} refused your blackmail. They will not wake up tomorrow.` });
+        b.set(R.newMsg(S.code, S.chamberKey), { from: "GM", name: "Game Master", system: true, text: `⚠️ ${nm} refused the blackmail — and has paid the price.`, ts: Date.now() });
       } else {
         b.update(R.secret(S.code), { gmLog: arrayUnion(L(`🤝 ${nm} declined recruitment.`)) });
-        b.update(R.chamber(S.code, S.chamberKey), { mode: "murder", status: `${nm} refused to join you. You may still choose to murder tonight.` });
-        b.set(R.newMsg(S.code, S.chamberKey), { from: "GM", name: "Game Master", system: true, text: `❌ ${nm} declined your offer. You may now nominate a murder.`, ts: Date.now() });
+        b.update(chRef, { [`acts.${slot}.state`]: "refused", status: `${nm} refused to join you.` });
+        b.set(R.newMsg(S.code, S.chamberKey), { from: "GM", name: "Game Master", system: true, text: `❌ ${nm} declined your offer (action ${slot}).`, ts: Date.now() });
       }
       await b.commit();
       toast(`${nm} DECLINED`, "info", 6000);
@@ -1295,22 +1400,27 @@ async function handleOffer(pid) {
 }
 
 async function revealBreakfast() {
-  const g = S.game, s = S.secret, pm = s.pendingMurder;
+  const g = S.game, s = S.secret;
+  const victims = [...new Set(allPending(s).filter((pm) => pm && !pm.blocked && g.players[pm.pid]?.status === "alive").map((pm) => pm.pid))];
   const b = writeBatch(db), gp = { breakfastDone: true };
-  if (pm && !pm.blocked && g.players[pm.pid]?.status === "alive") {
-    const nm = pname(g, pm.pid);
-    gp[`players.${pm.pid}.status`] = "murdered";
-    gp[`players.${pm.pid}.revealedRole`] = s.roles?.[pm.pid] || "Faithful";
-    gp[`players.${pm.pid}.eliminatedDay`] = g.day;
-    gp.announce = ann("murder", { pid: pm.pid, name: nm, text: `🔪 ${nm} was murdered in the night.` });
-    gp.log = arrayUnion(L(`🔪 ${nm} was murdered by the Traitors.`));
+  if (victims.length) {
+    const names = victims.map((p) => pname(g, p));
+    victims.forEach((p) => {
+      gp[`players.${p}.status`] = "murdered";
+      gp[`players.${p}.revealedRole`] = s.roles?.[p] || "Faithful";
+      gp[`players.${p}.eliminatedDay`] = g.day;
+    });
+    const joined = names.join(" & ");
+    gp.announce = ann("murder", { pid: victims[0], name: joined, text: `🔪 ${joined} ${victims.length > 1 ? "were" : "was"} murdered in the night.` });
+    gp.log = arrayUnion(...names.map((nm) => L(`🔪 ${nm} was murdered by the Traitors.`)));
   } else {
     gp.announce = ann("nomurder", { text: "🌅 Everyone made it through the night… this time." });
     gp.log = arrayUnion(L("🌅 Nobody was murdered last night."));
   }
+  gp.odds = oddsValue(victims);
   Object.keys(s.shields || {}).forEach((p) => keyOf(p) && b.update(R.priv(S.code, keyOf(p)), { shield: false }));
   g.order.forEach((p) => { if (g.players[p]?.shieldPublic) gp[`players.${p}.shieldPublic`] = false; });
-  b.update(R.secret(S.code), { pendingMurder: null, shields: {} });
+  b.update(R.secret(S.code), { pendingMurder: null, pendingMurders: [], shields: {} });
   b.update(R.game(S.code), gp);
   await b.commit();
 }
@@ -1355,6 +1465,7 @@ async function endGame(forceWinner) {
   const finalRoles = {}; g.order.forEach((p) => (finalRoles[p] = s.roles?.[p] || "Faithful"));
   const patch = {
     phase: "finished", winner, winners, share, finalRoles, finishedAt: Date.now(), timer: null, vote: null,
+    odds: g.settings?.showOdds === false ? null : (winner === "Traitors" ? { f: 0, t: 100, ts: Date.now() } : { f: 100, t: 0, ts: Date.now() }),
     announce: ann("win", { winner, text: winner === "Traitors" ? "🗡 The Traitors have won!" : "🛡 The Faithful have won!" }),
     log: arrayUnion(L(`🏆 ${winner === "Traitors" ? "The TRAITORS" : "The FAITHFUL"} won. ${winners.map((p) => pname(g, p)).join(", ")} share ${money(g.pot, g.currency)}.`)),
   };
@@ -1365,13 +1476,13 @@ async function endGame(forceWinner) {
 async function resetGame() {
   if (!await confirmBox("Play again?", "Same players and PINs. Roles, pot, statuses and votes are reset; a new game begins in the Lobby.", "🔁 Reset")) return;
   const g = S.game, b = writeBatch(db);
-  const gp = { phase: "lobby", day: 0, pot: 0, broadcast: null, vote: null, reveal: null, banish: null, winner: null, winners: null, share: null, finalRoles: null, finishedAt: null, timer: null, missions: [], breakfastDone: false,
+  const gp = { phase: "lobby", day: 0, pot: 0, broadcast: null, odds: null, vote: null, reveal: null, banish: null, winner: null, winners: null, share: null, finalRoles: null, finishedAt: null, timer: null, missions: [], breakfastDone: false,
     announce: ann("text", { text: "🔁 A new game is about to begin…" }), log: [{ t: Date.now(), day: 0, text: "🔁 A new game begins with the same players." }] };
   g.order.forEach((p) => {
     gp[`players.${p}.status`] = "alive"; gp[`players.${p}.revealedRole`] = null; gp[`players.${p}.shieldPublic`] = false; gp[`players.${p}.eliminatedDay`] = null;
     if (keyOf(p)) b.update(R.priv(S.code, keyOf(p)), { role: null, traitorKey: deleteField(), fellows: [], shield: false, dagger: false, offer: null, offerResponse: null, notice: null, seenRole: false });
   });
-  b.update(R.secret(S.code), { roles: {}, traitorKey: null, shields: {}, daggers: {}, pendingMurder: null, revealQueue: [], revealResult: null, gmLog: [] });
+  b.update(R.secret(S.code), { roles: {}, traitorKey: null, shields: {}, daggers: {}, pendingMurder: null, pendingMurders: [], revealQueue: [], revealResult: null, gmLog: [] });
   b.update(R.game(S.code), gp);
   await b.commit();
 }
