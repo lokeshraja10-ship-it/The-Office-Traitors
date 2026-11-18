@@ -117,3 +117,7 @@ js/display.js     Big-screen logic (timer, reveals, dramatic overlays)
 firestore.rules   Security rules — paste into Firebase console
 .nojekyll         Tells GitHub Pages to serve files as-is
 ```
+
+### v5 additions
+- **🔒 Message Storyteller:** each logged-in player has an always-visible private button. Messages and GM replies stay in that player's protected private document.
+- **5-second voting countdown:** banishment and endgame voting now show a synchronized 5 → 1 countdown on player phones and the Big Screen before ballots open.
