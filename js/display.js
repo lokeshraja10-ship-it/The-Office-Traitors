@@ -67,6 +67,7 @@ function tiles(g) {
 
 function stage(g) {
   const v = g.vote, r = g.reveal;
+  if (g.voteCountdown?.active) return `<div class="vote-countdown-display"><div>VOTING OPENS IN</div><div class="vote-countdown-num">${esc(g.voteCountdown.n)}</div><p class="lead">${g.voteCountdown.kind==="endgame"?"🔥 Endgame vote":"🗳 Banishment vote"}</p></div>`;
   switch (g.phase) {
     case "lobby": {
       const url = pageUrl("play.html", { g: g.code });

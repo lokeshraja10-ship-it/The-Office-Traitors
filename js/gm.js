@@ -776,7 +776,8 @@ function renderRoster() {
   }).join("");
   el.innerHTML = `<div class="card-head"><h3>👥 Players (${g.order.length})</h3>${manual ? `<span class="tiny">Tick = Traitor</span>` : ""}${g.phase !== "finished" ? `<button class="btn btn-xs btn-primary" data-act="addLatePlayer">➕ Add player</button>` : ""}</div>
     ${g.order.length ? `<div class="table-wrap"><table class="roster">${rows}</table></div>` : `<p class="muted">No players yet. Add names in the Lobby.</p>`}
-    <p class="tiny">📱 logged in · 👁 seen role · 🛡 shield · 🗡 dagger · PIN shown for re-sending invites.</p>`;
+    <p class="tiny">📱 logged in · 👁 seen role · 🛡 shield · 🗡 dagger · PIN shown for re-sending invites.</p>
+    <div class="gm-private-inbox"><h3>🔒 Private messages to Storyteller</h3>${g.order.map(p=>{const ms=S.privs[p]?.gmMessages||[],last=ms[ms.length-1],unread=S.privs[p]?.gmUnread;return last?`<button class="btn btn-block ${unread?"btn-gold":"btn-ghost"}" data-act="gmPrivateChat" data-pid="${p}">${unread?"● ":""}${esc(pname(g,p))}: ${esc(last.text).slice(0,60)}</button>`:""}).join("")||`<p class="muted small">No private messages yet.</p>`}</div>`;
 }
 
 // ---------------------------------------------------------------- chamber monitor
@@ -852,6 +853,7 @@ const ACT = {
   printSlips: () => printSlips(),
   startGame: () => startGame(),
   playerMenu: (b) => playerMenu(b.dataset.pid),
+  gmPrivateChat: (b) => gmPrivateChat(b.dataset.pid),
 
   // timer
   timerStart() { const m = Math.max(1, Number($("#tMin")?.value) || 10); return upd({ timer: { running: true, endsAt: Date.now() + m * 60000, total: m * 60 } }); },
@@ -1108,6 +1110,15 @@ async function startGame() {
   S.manualTraitors.clear();
 }
 
+async function gmPrivateChat(pid) {
+  const g=S.game,pv=S.privs[pid],key=keyOf(pid); if(!pv||!key)return toast("Player private channel is unavailable.","error");
+  const msgs=[...(pv.gmMessages||[])].sort((a,b)=>(a.ts||0)-(b.ts||0));
+  const body=h(`<div><p class="tiny muted">Private: only ${esc(pname(g,pid))} and Game Master consoles can read this.</p><div class="gm-private-chat" id="gmMsgList"></div><form id="gmMsgForm" class="chat-form"><input id="gmMsgText" maxlength="500" placeholder="Reply privately…"><button class="btn btn-primary">Send</button></form></div>`);
+  const list=$("#gmMsgList",body); list.innerHTML=msgs.length?msgs.map(m=>`<div class="msg ${m.from==="GM"?"sys":""}"><b>${m.from==="GM"?"Storyteller":esc(pname(g,pid))}:</b> ${esc(m.text)}</div>`).join(""):`<p class="muted small">No messages yet.</p>`;
+  const wrap=h(`<div class="modal-backdrop"><div class="modal"><h3>🔒 ${esc(pname(g,pid))} ↔ Storyteller</h3><div class="modal-body"></div><div class="modal-actions"><button class="btn btn-ghost">Close</button></div></div></div>`); wrap.querySelector(".modal-body").append(body); wrap.querySelector(".modal-actions button").onclick=()=>wrap.remove(); document.body.append(wrap);
+  try{await updateDoc(R.priv(S.code,key),{gmUnread:false});}catch{}
+  $("#gmMsgForm",body).onsubmit=async e=>{e.preventDefault();const text=$("#gmMsgText",body).value.trim();if(!text)return;const fresh=(await getDoc(R.priv(S.code,key))).data()||{};await updateDoc(R.priv(S.code,key),{gmMessages:[...(fresh.gmMessages||[]),{from:"GM",text:text.slice(0,500),ts:Date.now()}],gmUnread:false});wrap.remove();toast("Private reply sent.","ok");};
+}
 async function playerMenu(pid) {
   const g = S.game, s = S.secret || {}, pl = g.players[pid]; if (!pl) return;
   const started = !!s.traitorKey && g.phase !== "lobby";
@@ -1236,8 +1247,9 @@ async function appointTraitor() {
 async function openVote(kind, voters, candidates, label) {
   if (!voters.length) return toast("No eligible voters.", "error");
   const g = S.game, id = (kind === "endgame" ? "E" : "B") + g.day + randStr(4);
+  for (let n=5;n>=1;n--) { await upd({ voteCountdown:{active:true,n,kind,ts:Date.now()} }); await new Promise(r=>setTimeout(r,1000)); }
   await updSecret({ revealQueue: [], revealResult: null });
-  await upd({
+  await upd({ voteCountdown: null,
     phase: "voting", vote: { id, kind, open: true, voters, candidates, submitted: [], label: label || "", openedAt: Date.now() },
     reveal: null, timer: null,
     announce: ann("text", { text: kind === "endgame" ? "🔥 Endgame vote: END the game or BANISH again? Vote on your phone." : (label ? `🗳 ${label} — vote on your phone.` : "🗳 Voting is open! Cast your vote secretly on your phone.") }),

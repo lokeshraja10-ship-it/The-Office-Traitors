@@ -249,6 +249,23 @@ function renderTabs() {
   $$("#tabs button").forEach((b) => (b.onclick = () => { S.tab = b.dataset.tab; S.secretOpen = false; render(); window.scrollTo(0, 0); }));
 }
 
+// ---------------------------------------------------------------- PRIVATE PLAYER ↔ STORYTELLER
+function openGmPrivateChat() {
+  const msgs = [...(S.priv?.gmMessages || [])].sort((a,b)=>(a.ts||0)-(b.ts||0));
+  const body = h(`<div><p class="tiny muted">Only you and the Game Master can read this conversation.</p><div class="gm-private-chat" id="gmPrivateList"></div><form id="gmPrivateForm" class="chat-form"><input id="gmPrivateText" maxlength="500" placeholder="Ask the Storyteller privately…" autocomplete="off"><button class="btn btn-primary">Send</button></form></div>`);
+  const list = $("#gmPrivateList", body);
+  list.innerHTML = msgs.length ? msgs.map(m=>`<div class="msg ${m.from==="GM"?"sys":""}"><b>${m.from==="GM"?"Storyteller":"You"}:</b> ${esc(m.text)}<div class="tiny muted">${new Date(m.ts||Date.now()).toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"})}</div></div>`).join("") : `<p class="muted small">No private messages yet.</p>`;
+  list.scrollTop = list.scrollHeight;
+  const wrap = h(`<div class="modal-backdrop"><div class="modal"><h3>🔒 Message Storyteller</h3><div class="modal-body"></div><div class="modal-actions"><button class="btn btn-ghost">Close</button></div></div></div>`);
+  wrap.querySelector(".modal-body").append(body); wrap.querySelector(".modal-actions button").onclick=()=>wrap.remove();
+  wrap.addEventListener("click",e=>{if(e.target===wrap)wrap.remove();}); document.body.append(wrap);
+  $("#gmPrivateForm",body).onsubmit=async e=>{e.preventDefault();const text=$("#gmPrivateText",body).value.trim();if(!text)return;try{await updateDoc(R.priv(S.code,S.key),{gmMessages:[...msgs,{from:"PLAYER",text:text.slice(0,500),ts:Date.now()}],gmUnread:true});wrap.remove();toast("Private message sent to the Storyteller.","ok");}catch(err){toast(errMsg(err),"error");}};
+}
+function renderVoteCountdown(){
+  const el=$("#voteCountdownOverlay");if(!el)return;const c=S.game?.voteCountdown;
+  if(!c||!c.active){el.classList.add("hidden");el.innerHTML="";return;}
+  el.classList.remove("hidden");el.innerHTML=`<div class="vote-countdown-card"><div class="tiny">VOTING OPENS IN</div><div class="vote-countdown-num">${esc(c.n)}</div><div>${c.kind==="endgame"?"🔥 Endgame vote":"🗳 Banishment vote"}</div><p class="tiny muted">Get ready. Your ballot will open automatically.</p></div>`;
+}
 // ---------------------------------------------------------------- HOME
 function banner(icon, title, text = "") {
   return `<div class="phase-banner"><div class="ico">${icon}</div><h2>${title}</h2>${text ? `<p class="muted">${text}</p>` : ""}</div>`;
